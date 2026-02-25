@@ -2,7 +2,16 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { db, seedExercises } from '@/lib/db';
-import type { Exercise, Tab, WorkoutTemplate } from '@/lib/types';
+import type {
+  ActiveWorkout,
+  Exercise,
+  LoggedExercise,
+  Tab,
+  WeightUnit,
+  WorkoutEntry,
+  WorkoutSet,
+  WorkoutTemplate
+} from '@/lib/types';
 import {
   DndContext,
   PointerSensor,
@@ -23,15 +32,38 @@ const tabs: { key: Tab; label: string }[] = [
   { key: 'settings', label: 'Settings' }
 ];
 
+const ACTIVE_WORKOUT_META_KEY = 'active_workout';
+const WEIGHT_UNIT_META_KEY = 'weight_unit';
+const DARK_MODE_META_KEY = 'dark_mode';
+
+const makeId = () => (typeof crypto !== 'undefined' ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
+
+function createDefaultSet(): WorkoutSet {
+  return { id: makeId(), weight: '', reps: '', completed: false };
+}
+
+function createWorkoutExercise(exercise: Exercise): LoggedExercise {
+  return {
+    instanceId: makeId(),
+    exerciseId: exercise.id,
+    name: exercise.name,
+    sets: [createDefaultSet()]
+  };
+}
+
 export default function AppShell() {
   const [tab, setTab] = useState<Tab>('exercises');
   const [exercises, setExercises] = useState<Exercise[]>([]);
   const [templates, setTemplates] = useState<WorkoutTemplate[]>([]);
+  const [workouts, setWorkouts] = useState<WorkoutEntry[]>([]);
   const [query, setQuery] = useState('');
   const [equipment, setEquipment] = useState<string>('all');
   const [bodyPart, setBodyPart] = useState<string>('all');
   const [selectedExercise, setSelectedExercise] = useState<Exercise | null>(null);
+  const [selectedWorkout, setSelectedWorkout] = useState<WorkoutEntry | null>(null);
   const [darkMode, setDarkMode] = useState(false);
+  const [weightUnit, setWeightUnit] = useState<WeightUnit>('kg');
+  const [activeWorkout, setActiveWorkout] = useState<ActiveWorkout | null>(null);
 
   const sensors = useSensors(useSensor(PointerSensor), useSensor(TouchSensor));
 
@@ -39,18 +71,64 @@ export default function AppShell() {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
-  useEffect(() => {
-    const init = async () => {
-      await seedExercises();
-      setExercises(await db.exercises.toArray());
-      setTemplates(await db.templates.orderBy('updatedAt').reverse().toArray());
-    };
-    init();
-  }, []);
-
   const refreshTemplates = async () => {
     setTemplates(await db.templates.orderBy('updatedAt').reverse().toArray());
   };
+
+  const refreshWorkouts = async () => {
+    setWorkouts(await db.workouts.orderBy('endedAt').reverse().toArray());
+  };
+
+  useEffect(() => {
+    const init = async () => {
+      await seedExercises();
+      const [exerciseRows, templateRows, workoutRows, savedUnit, savedDarkMode, savedActiveWorkout] = await Promise.all([
+        db.exercises.toArray(),
+        db.templates.orderBy('updatedAt').reverse().toArray(),
+        db.workouts.orderBy('endedAt').reverse().toArray(),
+        db.meta.get(WEIGHT_UNIT_META_KEY),
+        db.meta.get(DARK_MODE_META_KEY),
+        db.meta.get(ACTIVE_WORKOUT_META_KEY)
+      ]);
+
+      setExercises(exerciseRows);
+      setTemplates(templateRows);
+      setWorkouts(workoutRows);
+
+      if (savedUnit?.value === 'kg' || savedUnit?.value === 'lb') {
+        setWeightUnit(savedUnit.value);
+      }
+
+      if (savedDarkMode?.value === 'true' || savedDarkMode?.value === 'false') {
+        setDarkMode(savedDarkMode.value === 'true');
+      }
+
+      if (savedActiveWorkout?.value) {
+        const parsed = JSON.parse(savedActiveWorkout.value) as ActiveWorkout;
+        setActiveWorkout(parsed);
+        setTab('log');
+      }
+    };
+
+    init();
+  }, []);
+
+  useEffect(() => {
+    void db.meta.put({ key: DARK_MODE_META_KEY, value: String(darkMode) });
+  }, [darkMode]);
+
+  useEffect(() => {
+    void db.meta.put({ key: WEIGHT_UNIT_META_KEY, value: weightUnit });
+  }, [weightUnit]);
+
+  useEffect(() => {
+    if (activeWorkout) {
+      void db.meta.put({ key: ACTIVE_WORKOUT_META_KEY, value: JSON.stringify(activeWorkout) });
+      return;
+    }
+
+    void db.meta.delete(ACTIVE_WORKOUT_META_KEY);
+  }, [activeWorkout]);
 
   const equipmentOptions = useMemo(
     () => ['all', ...new Set(exercises.map((item) => item.equipment))].slice(0, 16),
@@ -80,6 +158,66 @@ export default function AppShell() {
       updatedAt: Date.now()
     });
     await refreshTemplates();
+  };
+
+  const startWorkoutFromTemplate = (template: WorkoutTemplate) => {
+    const workoutExercises = template.exercises
+      .sort((a, b) => a.order - b.order)
+      .map((item) => exercises.find((exercise) => exercise.id === item.exerciseId))
+      .filter((item): item is Exercise => Boolean(item))
+      .map((exercise) => createWorkoutExercise(exercise));
+
+    const nextWorkout: ActiveWorkout = {
+      id: makeId(),
+      templateId: template.id,
+      templateName: template.name,
+      startedAt: Date.now(),
+      exercises: workoutExercises
+    };
+
+    setActiveWorkout(nextWorkout);
+    setTab('log');
+  };
+
+  const startEmptyWorkout = () => {
+    setActiveWorkout({
+      id: makeId(),
+      templateName: 'Quick workout',
+      startedAt: Date.now(),
+      exercises: []
+    });
+    setTab('log');
+  };
+
+  const updateActiveWorkout = (updater: (workout: ActiveWorkout) => ActiveWorkout) => {
+    setActiveWorkout((current) => (current ? updater(current) : current));
+  };
+
+  const finishWorkout = async () => {
+    if (!activeWorkout) return;
+
+    const completedWorkout: WorkoutEntry = {
+      templateId: activeWorkout.templateId,
+      templateName: activeWorkout.templateName,
+      startedAt: activeWorkout.startedAt,
+      endedAt: Date.now(),
+      exercises: activeWorkout.exercises
+    };
+
+    await db.workouts.add(completedWorkout);
+    setActiveWorkout(null);
+    await refreshWorkouts();
+    setTab('history');
+  };
+
+  const deleteWorkout = async (workout: WorkoutEntry) => {
+    if (!workout.id) return;
+    if (!window.confirm('Delete this workout from history?')) return;
+    await db.workouts.delete(workout.id);
+    if (selectedWorkout?.id === workout.id) {
+      setSelectedWorkout(null);
+    }
+    await refreshWorkouts();
   };
 
   return (
@@ -135,13 +273,41 @@ export default function AppShell() {
               Create template
             </button>
             {templates.map((template) => (
-              <TemplateCard key={template.id} template={template} allExercises={exercises} refreshTemplates={refreshTemplates} sensors={sensors} />
+              <TemplateCard
+                key={template.id}
+                template={template}
+                allExercises={exercises}
+                refreshTemplates={refreshTemplates}
+                sensors={sensors}
+                onStart={() => startWorkoutFromTemplate(template)}
+              />
             ))}
           </div>
         )}
 
-        {tab === 'log' && <Placeholder title="Log" text="Quick logging workflow will land next." />}
-        {tab === 'history' && <Placeholder title="History" text="Past sessions and progress charts are planned." />}
+        {tab === 'log' && (
+          <LogScreen
+            activeWorkout={activeWorkout}
+            templates={templates}
+            exercises={exercises}
+            sensors={sensors}
+            weightUnit={weightUnit}
+            onStartTemplate={(templateId) => {
+              const template = templates.find((item) => item.id === templateId);
+              if (template) {
+                startWorkoutFromTemplate(template);
+              }
+            }}
+            onStartQuickWorkout={startEmptyWorkout}
+            onUpdateWorkout={updateActiveWorkout}
+            onFinishWorkout={finishWorkout}
+          />
+        )}
+
+        {tab === 'history' && (
+          <HistoryScreen workouts={workouts} weightUnit={weightUnit} onOpenWorkout={setSelectedWorkout} onDeleteWorkout={deleteWorkout} />
+        )}
+
         {tab === 'settings' && (
           <div className="card space-y-4">
             <h2 className="font-semibold">Settings</h2>
@@ -149,6 +315,21 @@ export default function AppShell() {
               Dark mode
               <input type="checkbox" checked={darkMode} onChange={(e) => setDarkMode(e.target.checked)} />
             </label>
+
+            <div className="space-y-2 text-sm">
+              <p className="font-medium">Weight units</p>
+              <div className="flex gap-2">
+                {(['kg', 'lb'] as WeightUnit[]).map((unit) => (
+                  <button
+                    key={unit}
+                    onClick={() => setWeightUnit(unit)}
+                    className={`rounded-lg border px-3 py-2 text-xs uppercase ${weightUnit === unit ? 'border-brand bg-brand/15 text-brand' : 'border-zinc-300 dark:border-zinc-700'}`}
+                  >
+                    {unit}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         )}
       </section>
@@ -175,16 +356,11 @@ export default function AppShell() {
           </div>
         </div>
       )}
-    </main>
-  );
-}
 
-function Placeholder({ title, text }: { title: string; text: string }) {
-  return (
-    <div className="card text-sm">
-      <h2 className="mb-2 font-semibold">{title}</h2>
-      <p className="text-zinc-500">{text}</p>
-    </div>
+      {selectedWorkout && (
+        <WorkoutDetailsModal workout={selectedWorkout} weightUnit={weightUnit} onClose={() => setSelectedWorkout(null)} />
+      )}
+    </main>
   );
 }
 
@@ -192,12 +368,14 @@ function TemplateCard({
   template,
   allExercises,
   refreshTemplates,
-  sensors
+  sensors,
+  onStart
 }: {
   template: WorkoutTemplate;
   allExercises: Exercise[];
   refreshTemplates: () => Promise<void>;
   sensors: ReturnType<typeof useSensors>;
+  onStart: () => void;
 }) {
   const [editing, setEditing] = useState(false);
 
@@ -240,6 +418,7 @@ function TemplateCard({
           value={template.name}
           onChange={(e) => save({ name: e.target.value })}
         />
+        <button className="rounded-lg border border-brand px-3 py-1 text-xs font-medium text-brand" onClick={onStart}>Start</button>
         <button className="text-xs text-zinc-500" onClick={() => setEditing((v) => !v)}>{editing ? 'Done' : 'Edit'}</button>
       </div>
 
@@ -261,6 +440,330 @@ function TemplateCard({
           ))}
         </select>
       )}
+    </div>
+  );
+}
+
+function LogScreen({
+  activeWorkout,
+  templates,
+  exercises,
+  sensors,
+  weightUnit,
+  onStartTemplate,
+  onStartQuickWorkout,
+  onUpdateWorkout,
+  onFinishWorkout
+}: {
+  activeWorkout: ActiveWorkout | null;
+  templates: WorkoutTemplate[];
+  exercises: Exercise[];
+  sensors: ReturnType<typeof useSensors>;
+  weightUnit: WeightUnit;
+  onStartTemplate: (templateId: number) => void;
+  onStartQuickWorkout: () => void;
+  onUpdateWorkout: (updater: (workout: ActiveWorkout) => ActiveWorkout) => void;
+  onFinishWorkout: () => Promise<void>;
+}) {
+  const [exercisePicker, setExercisePicker] = useState('');
+
+  if (!activeWorkout) {
+    return (
+      <div className="space-y-4">
+        <div className="card space-y-3">
+          <h2 className="font-semibold">Start workout</h2>
+          <p className="text-sm text-zinc-500">Pick a template to begin logging or start an empty workout.</p>
+          <select className="w-full rounded-lg border border-zinc-300 bg-transparent p-3 text-sm dark:border-zinc-700" defaultValue="" onChange={(e) => onStartTemplate(Number(e.target.value))}>
+            <option value="" disabled>Select a template</option>
+            {templates.map((template) => (
+              <option key={template.id} value={template.id}>{template.name}</option>
+            ))}
+          </select>
+          <button className="w-full rounded-xl border border-zinc-300 p-3 text-sm font-semibold dark:border-zinc-700" onClick={onStartQuickWorkout}>
+            Start quick workout
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const onExerciseDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    onUpdateWorkout((workout) => {
+      const oldIndex = workout.exercises.findIndex((item) => item.instanceId === active.id);
+      const newIndex = workout.exercises.findIndex((item) => item.instanceId === over.id);
+      return { ...workout, exercises: arrayMove(workout.exercises, oldIndex, newIndex) };
+    });
+  };
+
+  const addExercise = (exerciseId: string) => {
+    const exercise = exercises.find((item) => item.id === exerciseId);
+    if (!exercise) return;
+
+    onUpdateWorkout((workout) => ({ ...workout, exercises: [...workout.exercises, createWorkoutExercise(exercise)] }));
+    setExercisePicker('');
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="card space-y-2">
+        <h2 className="font-semibold">{activeWorkout.templateName}</h2>
+        <p className="text-xs text-zinc-500">Started {new Date(activeWorkout.startedAt).toLocaleString()}</p>
+        <p className="text-xs text-zinc-500">Weight unit: {weightUnit}</p>
+      </div>
+
+      <select
+        value={exercisePicker}
+        onChange={(e) => {
+          setExercisePicker(e.target.value);
+          if (e.target.value) {
+            addExercise(e.target.value);
+          }
+        }}
+        className="w-full rounded-lg border border-zinc-300 bg-transparent p-3 text-sm dark:border-zinc-700"
+      >
+        <option value="">Add exercise from library…</option>
+        {exercises.map((exercise) => (
+          <option key={exercise.id} value={exercise.id}>{exercise.name}</option>
+        ))}
+      </select>
+
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onExerciseDragEnd}>
+        <SortableContext items={activeWorkout.exercises.map((item) => item.instanceId)} strategy={verticalListSortingStrategy}>
+          <div className="space-y-3">
+            {activeWorkout.exercises.map((exercise, index) => (
+              <ActiveExerciseCard
+                key={exercise.instanceId}
+                index={index}
+                exercise={exercise}
+                weightUnit={weightUnit}
+                onChange={(patch) => {
+                  onUpdateWorkout((workout) => ({
+                    ...workout,
+                    exercises: workout.exercises.map((item) => (item.instanceId === exercise.instanceId ? patch(item) : item))
+                  }));
+                }}
+                onRemove={() => {
+                  onUpdateWorkout((workout) => ({
+                    ...workout,
+                    exercises: workout.exercises.filter((item) => item.instanceId !== exercise.instanceId)
+                  }));
+                }}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
+
+      <button className="w-full rounded-xl bg-brand p-3 text-sm font-semibold text-white" onClick={() => void onFinishWorkout()}>
+        Finish workout
+      </button>
+    </div>
+  );
+}
+
+function ActiveExerciseCard({
+  exercise,
+  index,
+  weightUnit,
+  onChange,
+  onRemove
+}: {
+  exercise: LoggedExercise;
+  index: number;
+  weightUnit: WeightUnit;
+  onChange: (patch: (exercise: LoggedExercise) => LoggedExercise) => void;
+  onRemove: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id: exercise.instanceId });
+  const style = { transform: CSS.Transform.toString(transform), transition };
+
+  return (
+    <div ref={setNodeRef} style={style} className="card space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <p className="font-semibold">{index + 1}. {exercise.name}</p>
+          <p className="text-xs text-zinc-500">Set logging ({weightUnit})</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button className="cursor-grab rounded border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600" {...attributes} {...listeners}>Drag</button>
+          <button className="text-xs text-rose-500" onClick={onRemove}>Remove exercise</button>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[280px] text-left text-xs">
+          <thead>
+            <tr className="border-b border-zinc-200 dark:border-zinc-700">
+              <th className="py-1">Set</th>
+              <th className="py-1">Weight ({weightUnit})</th>
+              <th className="py-1">Reps</th>
+              <th className="py-1">Done</th>
+            </tr>
+          </thead>
+          <tbody>
+            {exercise.sets.map((set, setIndex) => (
+              <tr key={set.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                <td className="py-1">{setIndex + 1}</td>
+                <td className="py-1 pr-2">
+                  <input
+                    className="w-20 rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
+                    inputMode="decimal"
+                    value={set.weight}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      onChange((currentExercise) => ({
+                        ...currentExercise,
+                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, weight: value } : item))
+                      }));
+                    }}
+                  />
+                </td>
+                <td className="py-1 pr-2">
+                  <input
+                    className="w-16 rounded border border-zinc-300 bg-transparent px-2 py-1 dark:border-zinc-700"
+                    inputMode="numeric"
+                    value={set.reps}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      onChange((currentExercise) => ({
+                        ...currentExercise,
+                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, reps: value } : item))
+                      }));
+                    }}
+                  />
+                </td>
+                <td className="py-1">
+                  <input
+                    type="checkbox"
+                    checked={set.completed}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      onChange((currentExercise) => ({
+                        ...currentExercise,
+                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, completed: checked } : item))
+                      }));
+                    }}
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <button
+          className="rounded-lg border border-zinc-300 px-3 py-1 text-xs dark:border-zinc-700"
+          onClick={() => {
+            onChange((currentExercise) => ({
+              ...currentExercise,
+              sets: [...currentExercise.sets, createDefaultSet()]
+            }));
+          }}
+        >
+          Add set
+        </button>
+        <button
+          className="rounded-lg border border-zinc-300 px-3 py-1 text-xs dark:border-zinc-700"
+          onClick={() => {
+            onChange((currentExercise) => {
+              const last = currentExercise.sets[currentExercise.sets.length - 1];
+              if (!last) return currentExercise;
+
+              return {
+                ...currentExercise,
+                sets: [...currentExercise.sets, { ...last, id: makeId(), completed: false }]
+              };
+            });
+          }}
+        >
+          Copy last set
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HistoryScreen({
+  workouts,
+  weightUnit,
+  onOpenWorkout,
+  onDeleteWorkout
+}: {
+  workouts: WorkoutEntry[];
+  weightUnit: WeightUnit;
+  onOpenWorkout: (workout: WorkoutEntry) => void;
+  onDeleteWorkout: (workout: WorkoutEntry) => void;
+}) {
+  if (!workouts.length) {
+    return (
+      <div className="card text-sm">
+        <h2 className="mb-2 font-semibold">History</h2>
+        <p className="text-zinc-500">No completed workouts yet.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {workouts.map((workout) => {
+        const totalSets = workout.exercises.reduce((sum, exercise) => sum + exercise.sets.length, 0);
+        const totalVolume = workout.exercises.reduce(
+          (sum, exercise) =>
+            sum +
+            exercise.sets.reduce((setSum, set) => {
+              const weight = Number(set.weight);
+              const reps = Number(set.reps);
+              if (!Number.isFinite(weight) || !Number.isFinite(reps)) return setSum;
+              return setSum + weight * reps;
+            }, 0),
+          0
+        );
+
+        return (
+          <div key={workout.id} className="card space-y-2">
+            <button className="w-full text-left" onClick={() => onOpenWorkout(workout)}>
+              <p className="font-semibold">{workout.templateName}</p>
+              <p className="text-xs text-zinc-500">{new Date(workout.endedAt).toLocaleString()}</p>
+              <p className="text-xs text-zinc-500">
+                {workout.exercises.length} exercises • {totalSets} sets • {Math.round(totalVolume)} {weightUnit} total volume
+              </p>
+            </button>
+            <button className="text-xs text-rose-500" onClick={() => onDeleteWorkout(workout)}>Delete</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function WorkoutDetailsModal({ workout, weightUnit, onClose }: { workout: WorkoutEntry; weightUnit: WeightUnit; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-20 bg-black/60 p-4" onClick={onClose}>
+      <div className="card mx-auto mt-8 max-h-[85vh] max-w-md overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-lg font-bold">{workout.templateName}</h3>
+        <p className="text-xs text-zinc-500">{new Date(workout.startedAt).toLocaleString()} - {new Date(workout.endedAt).toLocaleString()}</p>
+
+        <div className="mt-3 space-y-3">
+          {workout.exercises.map((exercise) => (
+            <div key={exercise.instanceId} className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
+              <p className="mb-2 text-sm font-semibold">{exercise.name}</p>
+              <ul className="space-y-1 text-xs">
+                {exercise.sets.map((set, idx) => (
+                  <li key={set.id}>
+                    Set {idx + 1}: {set.weight || '-'} {weightUnit} × {set.reps || '-'} reps {set.completed ? '✓' : ''}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+
+        <button className="mt-4 rounded-lg border px-3 py-2 text-sm" onClick={onClose}>Close</button>
+      </div>
     </div>
   );
 }
