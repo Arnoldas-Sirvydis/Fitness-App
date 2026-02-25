@@ -1,10 +1,11 @@
 import Dexie, { type Table } from 'dexie';
-import type { Exercise, WorkoutTemplate } from './types';
+import type { Exercise, WorkoutEntry, WorkoutTemplate } from './types';
 import exerciseSeed from '@/data/exercises.json';
 
 class PulseLogDB extends Dexie {
   exercises!: Table<Exercise, string>;
   templates!: Table<WorkoutTemplate, number>;
+  workouts!: Table<WorkoutEntry, number>;
   meta!: Table<{ key: string; value: string }, string>;
 
   constructor() {
@@ -12,6 +13,13 @@ class PulseLogDB extends Dexie {
     this.version(1).stores({
       exercises: 'id, name, bodyPart, equipment, target',
       templates: '++id, name, updatedAt',
+      meta: 'key'
+    });
+
+    this.version(2).stores({
+      exercises: 'id, name, bodyPart, equipment, target',
+      templates: '++id, name, updatedAt',
+      workouts: '++id, startedAt, endedAt',
       meta: 'key'
     });
   }
