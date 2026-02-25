@@ -51,6 +51,24 @@ function createWorkoutExercise(exercise: Exercise): LoggedExercise {
   };
 }
 
+function parseNonNegativeNumber(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
+function normalizeNumericInput(value: string, allowDecimal: boolean) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+
+  const numericPattern = allowDecimal ? /^\d*\.?\d*$/ : /^\d*$/;
+  if (!numericPattern.test(trimmed)) return null;
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return trimmed;
+}
+
 export default function AppShell() {
   const [tab, setTab] = useState<Tab>('exercises');
   const [exercises, setExercises] = useState<Exercise[]>([]);
@@ -65,7 +83,10 @@ export default function AppShell() {
   const [weightUnit, setWeightUnit] = useState<WeightUnit>('kg');
   const [activeWorkout, setActiveWorkout] = useState<ActiveWorkout | null>(null);
 
-  const sensors = useSensors(useSensor(PointerSensor), useSensor(TouchSensor));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } })
+  );
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -104,9 +125,13 @@ export default function AppShell() {
       }
 
       if (savedActiveWorkout?.value) {
-        const parsed = JSON.parse(savedActiveWorkout.value) as ActiveWorkout;
-        setActiveWorkout(parsed);
-        setTab('log');
+        try {
+          const parsed = JSON.parse(savedActiveWorkout.value) as ActiveWorkout;
+          setActiveWorkout(parsed);
+          setTab('log');
+        } catch {
+          await db.meta.delete(ACTIVE_WORKOUT_META_KEY);
+        }
       }
     };
 
@@ -465,7 +490,10 @@ function LogScreen({
   onUpdateWorkout: (updater: (workout: ActiveWorkout) => ActiveWorkout) => void;
   onFinishWorkout: () => Promise<void>;
 }) {
-  const [exercisePicker, setExercisePicker] = useState('');
+  const [showExercisePicker, setShowExercisePicker] = useState(false);
+  const [pickerQuery, setPickerQuery] = useState('');
+  const [pickerEquipment, setPickerEquipment] = useState<string>('all');
+  const [pickerBodyPart, setPickerBodyPart] = useState<string>('all');
 
   if (!activeWorkout) {
     return (
@@ -503,8 +531,23 @@ function LogScreen({
     if (!exercise) return;
 
     onUpdateWorkout((workout) => ({ ...workout, exercises: [...workout.exercises, createWorkoutExercise(exercise)] }));
-    setExercisePicker('');
+    setShowExercisePicker(false);
+    setPickerQuery('');
+    setPickerEquipment('all');
+    setPickerBodyPart('all');
   };
+
+  const availableExercises = exercises.filter(
+    (exercise) => !activeWorkout.exercises.some((item) => item.exerciseId === exercise.id)
+  );
+  const equipmentOptions = ['all', ...new Set(availableExercises.map((item) => item.equipment))].slice(0, 16);
+  const bodyPartOptions = ['all', ...new Set(availableExercises.map((item) => item.bodyPart))].slice(0, 16);
+  const filteredExercises = availableExercises.filter((item) => {
+    const matchesText = item.name.toLowerCase().includes(pickerQuery.toLowerCase());
+    const matchesEquipment = pickerEquipment === 'all' || item.equipment === pickerEquipment;
+    const matchesBodyPart = pickerBodyPart === 'all' || item.bodyPart === pickerBodyPart;
+    return matchesText && matchesEquipment && matchesBodyPart;
+  });
 
   return (
     <div className="space-y-4">
@@ -514,21 +557,12 @@ function LogScreen({
         <p className="text-xs text-zinc-500">Weight unit: {weightUnit}</p>
       </div>
 
-      <select
-        value={exercisePicker}
-        onChange={(e) => {
-          setExercisePicker(e.target.value);
-          if (e.target.value) {
-            addExercise(e.target.value);
-          }
-        }}
+      <button
         className="w-full rounded-lg border border-zinc-300 bg-transparent p-3 text-sm dark:border-zinc-700"
+        onClick={() => setShowExercisePicker(true)}
       >
-        <option value="">Add exercise from library…</option>
-        {exercises.map((exercise) => (
-          <option key={exercise.id} value={exercise.id}>{exercise.name}</option>
-        ))}
-      </select>
+        Add exercise from library…
+      </button>
 
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onExerciseDragEnd}>
         <SortableContext items={activeWorkout.exercises.map((item) => item.instanceId)} strategy={verticalListSortingStrategy}>
@@ -542,7 +576,9 @@ function LogScreen({
                 onChange={(patch) => {
                   onUpdateWorkout((workout) => ({
                     ...workout,
-                    exercises: workout.exercises.map((item) => (item.instanceId === exercise.instanceId ? patch(item) : item))
+                    exercises: workout.exercises.map((item) =>
+                      item.instanceId === exercise.instanceId ? patch(item) : item
+                    )
                   }));
                 }}
                 onRemove={() => {
@@ -560,6 +596,65 @@ function LogScreen({
       <button className="w-full rounded-xl bg-brand p-3 text-sm font-semibold text-white" onClick={() => void onFinishWorkout()}>
         Finish workout
       </button>
+
+      {showExercisePicker && (
+        <div className="fixed inset-0 z-30 bg-black/60 p-4" onClick={() => setShowExercisePicker(false)}>
+          <div className="card mx-auto mt-6 max-h-[85vh] max-w-md overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h3 className="text-base font-semibold">Add exercise</h3>
+              <button className="rounded-lg border border-zinc-300 px-3 py-1 text-xs dark:border-zinc-700" onClick={() => setShowExercisePicker(false)}>
+                Close
+              </button>
+            </div>
+
+            <input
+              value={pickerQuery}
+              onChange={(e) => setPickerQuery(e.target.value)}
+              className="w-full rounded-xl border border-zinc-300 bg-white p-3 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+              placeholder="Search exercises"
+            />
+
+            <div className="mt-3">
+              <p className="mb-2 text-xs font-semibold uppercase text-zinc-500">Equipment</p>
+              <div className="flex flex-wrap gap-2">
+                {equipmentOptions.map((opt) => (
+                  <button key={opt} onClick={() => setPickerEquipment(opt)} className={`chip ${pickerEquipment === opt ? 'border-brand bg-brand/15' : 'border-zinc-300 dark:border-zinc-700'}`}>
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <p className="mb-2 text-xs font-semibold uppercase text-zinc-500">Body part</p>
+              <div className="flex flex-wrap gap-2">
+                {bodyPartOptions.map((opt) => (
+                  <button key={opt} onClick={() => setPickerBodyPart(opt)} className={`chip ${pickerBodyPart === opt ? 'border-brand bg-brand/15' : 'border-zinc-300 dark:border-zinc-700'}`}>
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-4 space-y-2">
+              {filteredExercises.length ? (
+                filteredExercises.map((exercise) => (
+                  <button
+                    key={exercise.id}
+                    onClick={() => addExercise(exercise.id)}
+                    className="w-full rounded-lg border border-zinc-200 p-3 text-left text-sm dark:border-zinc-700"
+                  >
+                    <p className="font-semibold">{exercise.name}</p>
+                    <p className="text-xs text-zinc-500">{exercise.bodyPart} • {exercise.equipment}</p>
+                  </button>
+                ))
+              ) : (
+                <p className="text-sm text-zinc-500">No exercises match your filters.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -580,6 +675,16 @@ function ActiveExerciseCard({
   const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id: exercise.instanceId });
   const style = { transform: CSS.Transform.toString(transform), transition };
 
+  const removeSet = (setId: string) => {
+    onChange((currentExercise) => {
+      if (currentExercise.sets.length <= 1) return currentExercise;
+      return {
+        ...currentExercise,
+        sets: currentExercise.sets.filter((item) => item.id !== setId)
+      };
+    });
+  };
+
   return (
     <div ref={setNodeRef} style={style} className="card space-y-3">
       <div className="flex items-center justify-between gap-2">
@@ -594,13 +699,14 @@ function ActiveExerciseCard({
       </div>
 
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[280px] text-left text-xs">
+        <table className="w-full min-w-[320px] text-left text-xs">
           <thead>
             <tr className="border-b border-zinc-200 dark:border-zinc-700">
               <th className="py-1">Set</th>
               <th className="py-1">Weight ({weightUnit})</th>
               <th className="py-1">Reps</th>
               <th className="py-1">Done</th>
+              <th className="py-1 text-right">Remove</th>
             </tr>
           </thead>
           <tbody>
@@ -613,10 +719,12 @@ function ActiveExerciseCard({
                     inputMode="decimal"
                     value={set.weight}
                     onChange={(e) => {
-                      const value = e.target.value;
+                      const nextWeight = normalizeNumericInput(e.target.value, true);
+                      if (nextWeight === null) return;
+
                       onChange((currentExercise) => ({
                         ...currentExercise,
-                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, weight: value } : item))
+                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, weight: nextWeight } : item))
                       }));
                     }}
                   />
@@ -627,10 +735,12 @@ function ActiveExerciseCard({
                     inputMode="numeric"
                     value={set.reps}
                     onChange={(e) => {
-                      const value = e.target.value;
+                      const nextReps = normalizeNumericInput(e.target.value, false);
+                      if (nextReps === null) return;
+
                       onChange((currentExercise) => ({
                         ...currentExercise,
-                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, reps: value } : item))
+                        sets: currentExercise.sets.map((item) => (item.id === set.id ? { ...item, reps: nextReps } : item))
                       }));
                     }}
                   />
@@ -647,6 +757,16 @@ function ActiveExerciseCard({
                       }));
                     }}
                   />
+                </td>
+                <td className="py-1 text-right">
+                  <button
+                    className="rounded px-1 text-sm text-rose-500"
+                    onClick={() => removeSet(set.id)}
+                    aria-label={`Remove set ${setIndex + 1}`}
+                    title="Remove set"
+                  >
+                    🗑️
+                  </button>
                 </td>
               </tr>
             ))}
@@ -710,14 +830,21 @@ function HistoryScreen({
   return (
     <div className="space-y-3">
       {workouts.map((workout) => {
-        const totalSets = workout.exercises.reduce((sum, exercise) => sum + exercise.sets.length, 0);
+        const validSets = workout.exercises.flatMap((exercise) =>
+          exercise.sets.filter((set) => {
+            const weight = parseNonNegativeNumber(set.weight);
+            const reps = parseNonNegativeNumber(set.reps);
+            return weight !== null && reps !== null;
+          })
+        );
+        const totalSets = validSets.length;
         const totalVolume = workout.exercises.reduce(
           (sum, exercise) =>
             sum +
             exercise.sets.reduce((setSum, set) => {
-              const weight = Number(set.weight);
-              const reps = Number(set.reps);
-              if (!Number.isFinite(weight) || !Number.isFinite(reps)) return setSum;
+              const weight = parseNonNegativeNumber(set.weight);
+              const reps = parseNonNegativeNumber(set.reps);
+              if (weight === null || reps === null) return setSum;
               return setSum + weight * reps;
             }, 0),
           0
